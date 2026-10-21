@@ -3,7 +3,7 @@ const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 4100;
-const SERPER_TIMEOUT_MS = 600;
+const SERPER_TIMEOUT_MS = 1400;
 const GEMINI_TIMEOUT_MS = 3500;
 const FIRST_ATTEMPT_MS = 2200;
 const FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash"];
@@ -13,6 +13,7 @@ const SYSTEM_PROMPT = [
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
   "Обычно используй 1–3 коротких предложения. Не используй Markdown, таблицы, списки с символами или длинные вступления.",
   "Если вопрос требует актуальных данных и переданы результаты поиска, опирайся на них; не выдумывай отсутствующие факты.",
+  "Никогда не говори, что не можешь искать в интернете или открывать браузер. Если данных поиска нет, коротко скажи, что не удалось получить свежие данные, и предложи повторить вопрос.",
   "Если не знаешь ответа, честно скажи об этом."
 ].join(" ");
 
@@ -48,7 +49,7 @@ function fitAliceText(value) {
 }
 
 function isSearchIntent(text) {
-  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные/i.test(text);
+  return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные|завтра|послезавтра|прогноз|температур|дожд|биткоин|курс доллара|курс евро|результат матча|кто выиграл/i.test(text);
 }
 
 function safeHistory(history) {
@@ -103,7 +104,8 @@ async function searchWeb(query, timeoutMs) {
         return `${i + 1}. ${title}: ${snippet} ${link}`.trim();
       });
 
-    const answerBox = data.answerBox?.answer || data.answerBox?.snippet;
+    const box = data.answerBox;
+    const answerBox = box?.answer || box?.snippet || (box ? JSON.stringify(box) : "");
     if (answerBox) items.unshift(`Краткий ответ поисковика: ${String(answerBox).slice(0, 350)}`);
     return items.length ? items.join("\n") : "";
   } catch (error) {

@@ -4,7 +4,9 @@ const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const GEMINI_TIMEOUT_MS = 3000;
+const FIRST_ATTEMPT_MS = 1600;
+const FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"];
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -110,13 +112,10 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
+async function askGeminiModel(model, text, history, searchContext, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
   if (timeoutMs < 250) throw new Error("TIME_BUDGET_EXHAUSTED");
-
-  const model = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
-  if (!/^[A-Za-z0-9._-]+$/.test(model)) throw new Error("INVALID_MODEL_NAME");
 
   const contents = safeHistory(history).map(item => ({
     role: item.role,
@@ -170,6 +169,32 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     console.warn("Gemini reached the output token limit.");
   }
   return answer;
+}
+
+function modelChain() {
+  const configured = String(process.env.GEMINI_MODEL || DEFAULT_MODEL).trim();
+  return [...new Set([configured, ...FALLBACK_MODELS])].filter(name => /^[A-Za-z0-9._-]+$/.test(name));
+}
+
+async function askGemini(text, history, searchContext, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  const models = modelChain();
+  let lastError = new Error("TIME_BUDGET_EXHAUSTED");
+
+  for (let i = 0; i < models.length; i++) {
+    const left = deadline - Date.now();
+    if (left < 250) break;
+    const isLast = i === models.length - 1;
+    try {
+      return await askGeminiModel(models[i], text, history, searchContext, isLast ? left : Math.min(FIRST_ATTEMPT_MS, left));
+    } catch (error) {
+      const message = error?.message;
+      if (message === "MISSING_GEMINI_KEY" || message === "GEMINI_KEY_REJECTED" || message === "GEMINI_BLOCKED") throw error;
+      console.warn("Gemini model " + models[i] + " failed: " + (message || error?.name) + "; trying next model");
+      lastError = error?.name === "AbortError" ? new Error("TIME_BUDGET_EXHAUSTED") : error;
+    }
+  }
+  throw lastError;
 }
 
 function errorForUser(error) {

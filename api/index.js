@@ -1,3 +1,5 @@
+import { waitUntil } from "@vercel/functions";
+
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
@@ -17,14 +19,14 @@ const SYSTEM_PROMPT = [
   "Если не знаешь ответа, честно скажи об этом."
 ].join(" ");
 
-function aliceResponse(text, endSession = false, history = []) {
+function aliceResponse(text, endSession = false, history = [], pending = false) {
   return {
     version: "1.0",
     response: {
       text: fitAliceText(text),
       end_session: endSession
     },
-    session_state: { history }
+    session_state: { history, pending }
   };
 }
 
@@ -87,7 +89,7 @@ async function searchWeb(query, timeoutMs) {
         },
         body: JSON.stringify({ q: query, gl: "ru", hl: "ru", num: 3 })
       },
-      Math.min(SERPER_TIMEOUT_MS, timeoutMs)
+      timeoutMs
     );
 
     if (!response.ok) {
@@ -152,7 +154,7 @@ async function askGeminiModel(model, text, history, searchContext, timeoutMs) {
         }
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    timeoutMs
   );
 
   if (!response.ok) {
@@ -184,7 +186,7 @@ function modelChain() {
   return [...new Set([configured, ...FALLBACK_MODELS])].filter(name => /^[A-Za-z0-9._-]+$/.test(name));
 }
 
-async function askGemini(text, history, searchContext, timeoutMs) {
+async function askGemini(text, history, searchContext, timeoutMs, firstAttemptMs = FIRST_ATTEMPT_MS) {
   const deadline = Date.now() + timeoutMs;
   const models = modelChain();
   let lastError = new Error("TIME_BUDGET_EXHAUSTED");
@@ -194,7 +196,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     if (left < 250) break;
     const isLast = i === models.length - 1;
     try {
-      return await askGeminiModel(models[i], text, history, searchContext, isLast ? left : Math.min(FIRST_ATTEMPT_MS, left));
+      return await askGeminiModel(models[i], text, history, searchContext, isLast ? left : Math.min(firstAttemptMs, left));
     } catch (error) {
       const message = error?.message;
       if (message === "MISSING_GEMINI_KEY" || message === "GEMINI_KEY_REJECTED" || message === "GEMINI_BLOCKED") throw error;
@@ -223,6 +225,62 @@ function errorForUser(error) {
   }
 }
 
+// Answers are prepared in the background so a slow search/Gemini call does not hit Alice's 4.5 s limit.
+// Results are kept in memory per session (best effort: a cold start loses them).
+const jobs = new Map();
+const JOB_TTL_MS = 5 * 60 * 1000;
+const JOB_SEARCH_MS = 2500;
+const JOB_GEMINI_MS = 7500;
+const JOB_FIRST_ATTEMPT_MS = 3000;
+const READY_RE = /готов|дальше|что там|ответ|давай|слуша|продолж|нашл|узнал/i;
+const PENDING_TEXT = "Секунду, ещё ищу информацию. Скажи «готово», когда захочешь услышать ответ.";
+
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+
+function pruneJobs() {
+  const now = Date.now();
+  for (const [key, job] of jobs) {
+    if (now - job.at > JOB_TTL_MS) jobs.delete(key);
+  }
+}
+
+async function runJob(text, history) {
+  try {
+    let searchContext = "";
+    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
+      searchContext = await searchWeb(text, JOB_SEARCH_MS);
+    }
+    const answer = await askGemini(text, history, searchContext, JOB_GEMINI_MS, JOB_FIRST_ATTEMPT_MS);
+    return { answer };
+  } catch (error) {
+    console.warn("Alice job failed:", error?.message || "unknown error");
+    return { error };
+  }
+}
+
+async function replyFromJob(res, sessionId, job, oldHistory, waitMs) {
+  const result = await Promise.race([job.promise, sleep(Math.max(0, waitMs)).then(() => null)]);
+
+  if (!result) {
+    return res.status(200).json(aliceResponse(PENDING_TEXT, false, oldHistory, true));
+  }
+
+  jobs.delete(sessionId);
+
+  if (result.error) {
+    console.warn("Alice webhook returned a fallback response:", result.error?.message || "unknown error");
+    return res.status(200).json(aliceResponse(errorForUser(result.error), false, oldHistory));
+  }
+
+  const history = [
+    ...oldHistory,
+    { role: "user", text: job.question.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
+    { role: "model", text: result.answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
+  ].slice(-MAX_HISTORY_MESSAGES);
+
+  return res.status(200).json(aliceResponse(result.answer, false, history));
+}
+
 export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
@@ -242,6 +300,8 @@ export default async function handler(req, res) {
   const body = req.body && typeof req.body === "object" ? req.body : {};
   const text = String(body?.request?.command || body?.request?.original_utterance || "").trim();
   const oldHistory = safeHistory(body?.state?.session?.history);
+  const sessionId = String(body?.session?.session_id || "anon");
+  const pending = body?.state?.session?.pending === true;
 
   if (!text) {
     return res.status(200).json(aliceResponse(
@@ -251,32 +311,31 @@ export default async function handler(req, res) {
     ));
   }
 
-  try {
-    let searchContext = "";
-    if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
-      // Search has a very short budget because Alice expects a response within 4.5 seconds.
-      searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+  pruneJobs();
+
+  // The user asks for the answer that is still being prepared.
+  if (pending && text.length < 40 && READY_RE.test(text)) {
+    const job = jobs.get(sessionId);
+    if (!job) {
+      return res.status(200).json(aliceResponse(
+        "Не получилось сохранить ответ. Задай вопрос ещё раз.",
+        false,
+        oldHistory
+      ));
     }
-
-    const answer = await askGemini(
-      text,
-      oldHistory,
-      searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
-    );
-
-    const history = [
-      ...oldHistory,
-      { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
-      { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
-    ].slice(-MAX_HISTORY_MESSAGES);
-
-    return res.status(200).json(aliceResponse(answer, false, history));
-  } catch (error) {
-    const safeError = error?.message === "AbortError" ? "TIME_BUDGET_EXHAUSTED" : error;
-    console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
-    return res.status(200).json(aliceResponse(errorForUser(safeError), false, oldHistory));
+    return replyFromJob(res, sessionId, job, oldHistory, remainingMs() - 500);
   }
+
+  // A new question: prepare the answer in the background and reply right away if it is quick enough.
+  const promise = runJob(text, oldHistory);
+  const job = { promise, question: text, at: Date.now() };
+  jobs.set(sessionId, job);
+  try {
+    waitUntil(promise);
+  } catch (error) {
+    console.warn("waitUntil is not available:", error?.message || "unknown error");
+  }
+  return replyFromJob(res, sessionId, job, oldHistory, remainingMs() - 600);
 }
 
 export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };

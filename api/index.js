@@ -249,6 +249,8 @@ async function runJob(text, history) {
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
       searchContext = await searchWeb(text, JOB_SEARCH_MS);
+      if (!searchContext) searchContext = await searchWeb(text, JOB_SEARCH_MS);
+      if (!searchContext) searchContext = "Поиск в интернете не дал результатов, свежих данных нет.";
     }
     const answer = await askGemini(text, history, searchContext, JOB_GEMINI_MS, JOB_FIRST_ATTEMPT_MS);
     return { answer };

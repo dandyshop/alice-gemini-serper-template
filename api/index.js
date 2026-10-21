@@ -2,11 +2,11 @@ const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
+const TOTAL_RESPONSE_BUDGET_MS = 4100;
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 3000;
-const FIRST_ATTEMPT_MS = 1600;
-const FALLBACK_MODELS = ["gemini-3.8-flash", "gemini-3.5-flash-lite"];
+const GEMINI_TIMEOUT_MS = 3500;
+const FIRST_ATTEMPT_MS = 2200;
+const FALLBACK_MODELS = ["gemini-3.5-flash-lite", "gemini-3.8-flash"];
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -112,6 +112,11 @@ async function searchWeb(query, timeoutMs) {
   }
 }
 
+function thinkingConfigFor(model) {
+  // gemini-3.8-flash thinks at "medium" by default and has no "minimal" level; keep it fast for voice.
+  return model === "gemini-3.8-flash" ? { thinkingConfig: { thinkingLevel: "low" } } : {};
+}
+
 async function askGeminiModel(model, text, history, searchContext, timeoutMs) {
   const key = process.env.GEMINI_API_KEY;
   if (!key) throw new Error("MISSING_GEMINI_KEY");
@@ -140,7 +145,8 @@ async function askGeminiModel(model, text, history, searchContext, timeoutMs) {
         contents,
         generationConfig: {
           temperature: 0.5,
-          maxOutputTokens: 240
+          maxOutputTokens: 400,
+          ...thinkingConfigFor(model)
         }
       })
     },
